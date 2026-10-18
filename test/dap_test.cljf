@@ -13,6 +13,10 @@
     (println "ok   -" label)
     (do (swap! failures inc) (println "FAIL -" label "\n  got: " (pr-str got) "\n  want:" (pr-str want)))))
 
+;; mylib's scale as gfortran and as flang name it; the package is built
+;; by whichever compiler this clotran uses
+(def fortran-names ["__mylib_MOD_scale" "_QMmylibPscale"])
+
 (def proj (or (clotran.host.system/getenv "LSP_TEST_PROJ")
               (str (clotran.host.system/getProperty "user.dir") "/test/fixtures/proj")))
 
@@ -33,6 +37,8 @@
                      (let [m (rpc/read-message src)]
                        (cond (nil? m) (throw (ex-info (str "the stream ended before " label) {}))
                              (pred m) m
+                             ;; the program ended first: a breakpoint that never hit
+                             (and (= label "the stop") (= "terminated" (get m "event"))) (throw (ex-info (str "the session ended before " label) {}))
                              (> n 20000) (throw (ex-info (str "no " label) {}))
                              :else (recur (inc n))))))
         response (fn [cmd] (wait-for #(and (= "response" (get % "type")) (= cmd (get % "command"))) (str "the " cmd " response")))
@@ -45,7 +51,7 @@
            "clotran dap: using lldb-dap\n")
     (send! "launch" {"program" "debug.cljf" "cwd" proj})
     (wait-for #(= "initialized" (get % "event")) "initialized")
-    (request! "setFunctionBreakpoints" {"breakpoints" [{"name" "__mylib_MOD_scale"}]})
+    (request! "setFunctionBreakpoints" {"breakpoints" (mapv #(hash-map "name" %) fortran-names)})
     (request! "configurationDone" {})
     (let [stopped (wait-for #(= "stopped" (get % "event")) "the stop")
           tid (get-in stopped ["body" "threadId"])
@@ -53,9 +59,9 @@
           names (mapv #(get % "name") frames)]
       (check "stopped at the breakpoint" (get-in stopped ["body" "reason"]) "breakpoint")
       (check "the stack: the Fortran subroutine, its shim, clotran's package call and evaluator beneath"
-             [(first names) (second names)
+             [(contains? (set fortran-names) (first names)) (second names)
               (boolean (some #(str/includes? % "pkg_call") names)) (boolean (some #(str/includes? % "gce_eval") names))]
-             ["__mylib_MOD_scale" "mylib_scale_shim" true true])
+             [true "mylib_scale_shim" true true])
       ;; the source position comes from the objects clotran bind keeps beside
       ;; the library; the LOCALS do not yet: Apple's lldb has no Fortran
       ;; plugin and shows none -- clotran decoding them from their DWARF
