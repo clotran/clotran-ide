@@ -26,6 +26,27 @@ answers; the editor's unsaved text is read in the file's place.
 Positions on the wire are LSP's UTF-16 ones, converted against each
 line.
 
+## The debug adapter, stage one
+
+`clotran dap` speaks the debug adapter protocol to the editor (stdio,
+or `--port N`) and drives **lldb-dap** underneath -- Xcode's, one on
+PATH, or `CLOTRAN_LLDB_DAP` -- started on a port of its own and ended
+with the session. It names the backend once (`clotran dap: using
+lldb-dap`), rewrites `launch` -- the editor names a clotran program,
+`{"program": "src/app/main.cljf", "args": [...], "cwd": "..."}`, and
+the backend is handed `clotran-bin --launch` with it, so the debuggee
+is the one process clotran's launcher would have been -- and relays
+everything else both ways. A breakpoint in a package's Fortran stops
+with its source line, since `clotran bind` keeps a package's objects
+beside its library. What this stage lacks: the locals of a Fortran
+frame (Apple's lldb has no Fortran plugin; clotran will decode them
+from their DWARF locations), Clojure frames shown as Clojure, and
+backends other than lldb-dap.
+
+VS Code: the clotran extension contributes the `clotran` debug type. Emacs:
+clotran-mode adds a `dape` configuration. By hand, any DAP client
+started with `clotran dap` works.
+
 ## The pieces
 
 - `clotran.ide.json` -- JSON, RFC 8259, read and written. The oracle
@@ -37,6 +58,8 @@ line.
   clotran.net connection, and memory, for the tests.
 - `clotran.ide.lsp` -- the server: the index, the open documents, the
   requests above, and `main` for `clotran lsp [--port N] [--verbose]`.
+- `clotran.ide.dap` -- the debug adapter: the backend found and started,
+  `launch` rewritten, the relay, and `main` for `clotran dap`.
 
 ## Using it
 

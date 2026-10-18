@@ -31,6 +31,10 @@ if [ $st -ne 0 ]; then echo "clotran lsp exited $st:"; cat "$work/err.txt"; exit
 LSP_TEST=check LSP_TEST_FILE="$work/out.bin" run "$here/test/lsp_test.cljf" | tee "$work/2.txt"
 grep -q '^LSP STDIO TEST PASSED' "$work/2.txt" || { echo "the server said:"; cat "$work/err.txt"; exit 1; }
 
+echo "--- clotran dap, over lldb-dap, in one process ---"
+CLOTRAN_CACHE="$work/cache" run "$here/test/dap_test.cljf" | tee "$work/d.txt"
+grep -q '^DAP TEST PASSED\|^skipped:' "$work/d.txt" || exit 1
+
 # the real eglot, headless, when there is an Emacs 29 with clojure-mode:
 # EMACS, else the macOS application, else an emacs on PATH
 emacs=${EMACS:-}

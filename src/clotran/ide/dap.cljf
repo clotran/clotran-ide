@@ -1,0 +1,178 @@
+(ns clotran.ide.dap
+  "clotran's debug adapter, stage one (clotran's PLAN 31a and step 36):
+  `clotran dap`. It speaks the debug adapter protocol to the editor over
+  this process's stdio (or a TCP port) and drives the native debugger
+  underneath -- lldb-dap, started on a port of its own -- so every editor
+  debugs clotran the same way: VS Code, Emacs through dape, Neovim
+  through nvim-dap.
+
+  What this stage does itself:
+  - finds the backend (lldb-dap: Xcode's, or one on PATH) and says
+    which, once, as an output event;
+  - rewrites `launch`: the editor names a clotran program (a .cljf file
+    and its arguments, the project's directory); the backend is handed
+    clotran-bin --launch with them, so the debuggee is the one process
+    clotran's launcher would have been, project path and all;
+  - relays everything else both ways, unchanged, and ends the backend
+    when the session does.
+
+  So a breakpoint set in a package's Fortran source stops where it would
+  in any native debugger, with the stack and the locals (clotran bind
+  keeps a package's objects beside its library for this). Clojure frames
+  as Clojure, and values as Clojure text, are the next stages."
+  (:require [clojure.string :as str]
+            [clotran.ide.rpc :as rpc]
+            [clotran.net :as net]))
+
+(defonce ^:private state (atom {:verbose false}))
+
+(defn- err [& xs] (binding [*out* *err*] (apply println xs) (flush)))
+(defn- log [& xs] (when (:verbose @state) (apply err "clotran dap:" xs)))
+
+(def ^:private home (clotran.host.system/getProperty "clotran.home"))
+(def ^:private windows? (str/starts-with? (str (clotran.host.system/getProperty "os.name")) "Windows"))
+
+;;; ---- the backend -------------------------------------------------------------------
+
+(defn- on-path?
+  "The command where PATH finds it, or nil."
+  [cmd]
+  (let [sep (clotran.host.system/getProperty "path.separator")]
+    (some (fn [d] (some #(when (= :file (clotran-file-kind %)) %)
+                        (if windows? [(str d "/" cmd ".exe") (str d "/" cmd)] [(str d "/" cmd)])))
+          (remove str/blank? (str/split (or (clotran.host.system/getenv "PATH") "") (re-pattern (str "\\" sep)))))))
+
+(defn find-backend
+  "lldb-dap: CLOTRAN_LLDB_DAP, else the one Xcode's xcrun names, else one
+  on PATH; nil when there is none."
+  []
+  (or (clotran.host.system/getenv "CLOTRAN_LLDB_DAP")
+      (when-let [xcrun (and (not windows?) (on-path? "xcrun"))]
+        (let [tmp (clotran-temp-dir (or (clotran.host.system/getenv "TMPDIR") "/tmp"))
+              out (str tmp "/xcrun.txt")]
+          (when (zero? (clotran-run [xcrun "-f" "lldb-dap"] nil out nil true))
+            (let [p (str/trim (clotran-slurp out))]
+              (when (clotran-file-exists? p) p)))))
+      (on-path? "lldb-dap")))
+
+(defn- free-port []
+  (let [s (net/listen 0 {:host "127.0.0.1"})
+        p (:port s)]
+    (net/close s)
+    p))
+
+(defn- connect-with-patience [port]
+  (loop [n 0]
+    (or (try (net/connect "127.0.0.1" port) (catch clotran.host.throwable _ nil))
+        (if (< n 100)
+          (do (clotran.host.thread/sleep 100) (recur (inc n)))
+          (throw (ex-info (str "clotran dap: lldb-dap did not listen on port " port) {}))))))
+
+(defn- start-backend!
+  "lldb-dap on a port of its own: [its pid, the connection]."
+  [exe]
+  (let [port (free-port)
+        ;; its own output to a log, never to this process's stdout, which in
+        ;; stdio mode is the editor's channel
+        log-file (str (clotran-temp-dir (or (clotran.host.system/getenv "TMPDIR") "/tmp")) "/lldb-dap.log")
+        pid (clotran-run-pid [exe "--connection" (str "listen://localhost:" port)] nil log-file nil)]
+    (when-not (pos? pid) (throw (ex-info (str "clotran dap: could not start " exe) {})))
+    (log "started" exe "pid" pid "port" port)
+    [pid (connect-with-patience port)]))
+
+
+;;; ---- the launch request, rewritten -------------------------------------------------------
+
+(defn- env-strings [env]
+  (cond (map? env) (vec (for [[k v] env] (str k "=" v)))
+        (sequential? env) (vec env)
+        :else nil))
+
+(defn- rewrite-launch
+  "The editor's launch -- {program: a .cljf, args, cwd, env, stopOnEntry}
+  -- as lldb-dap's: clotran-bin --launch program args, in cwd."
+  [m]
+  (let [a (get m "arguments" {})
+        program (get a "program")
+        cwd (or (get a "cwd") (clotran.host.system/getProperty "user.dir"))
+        bin (str home "/clotran-bin" (when windows? ".exe"))
+        args (vec (concat ["--launch"] (when program [program]) (get a "args")))]
+    (assoc m "arguments"
+           (-> a
+               (dissoc "clotran")
+               (assoc "program" bin "args" args "cwd" cwd)
+               (cond-> (get a "env") (assoc "env" (env-strings (get a "env"))))))))
+
+;;; ---- the relay -------------------------------------------------------------------
+
+(defn- forward-backend!
+  "Every message from the backend to the client; the first initialize
+  response is followed by a word on which backend this is."
+  [backend client lock backend-name]
+  (let [src (rpc/source backend)]
+    (loop []
+      (when-let [m (rpc/read-message src)]
+        (log "<= " (or (get m "event") (get m "command")))
+        (when-not (and (= "response" (get m "type")) (= "disconnect" (get m "command")))
+          (locking lock (rpc/write-message client m)))
+        (when (and (= "response" (get m "type")) (= "initialize" (get m "command")))
+          (locking lock
+            (rpc/write-message client {"seq" 0 "type" "event" "event" "output"
+                                       "body" {"category" "console" "output" (str "clotran dap: using " backend-name "\n")}})))
+        (when (and (= "response" (get m "type")) (= "disconnect" (get m "command")))
+          ;; the editor may end this process the moment it has the disconnect
+          ;; response (VS Code does), so the backend is ended first
+          (when-let [pid (:pid @state)] (clotran-kill pid))
+          (swap! state assoc :done true)
+          (locking lock (rpc/write-message client m)))
+        (recur)))
+    (swap! state assoc :done true)))
+
+(defn serve
+  "The session over the client transport: the backend started, the two
+  relayed until the client disconnects or its stream ends, the backend
+  ended after."
+  [client]
+  (let [exe (or (find-backend)
+                (do (rpc/write-message client {"seq" 0 "type" "event" "event" "output"
+                                               "body" {"category" "stderr" "output" "clotran dap: no lldb-dap found (Xcode's, one on PATH, or CLOTRAN_LLDB_DAP)\n"}})
+                    (throw (ex-info "clotran dap: no lldb-dap found" {}))))
+        [pid conn] (start-backend! exe)
+        backend (rpc/socket conn)
+        lock (clotran.host.value.)
+        name (last (str/split exe #"[/\\]"))]
+    (swap! state assoc :done false :pid pid)
+    (future (try (forward-backend! backend client lock name)
+                 (catch clotran.host.throwable e (log "backend ended:" (ex-message e)) (swap! state assoc :done true))))
+    (try
+      (let [src (rpc/source client)]
+        (loop []
+          (when-not (:done @state)
+            (when-let [m (rpc/read-message src)]
+              (log "=> " (get m "command"))
+              (rpc/write-message backend (if (= "launch" (get m "command")) (rewrite-launch m) m))
+              (if (= "disconnect" (get m "command"))
+                ;; the response comes back through the relay, which ends then
+                (loop [n 0] (when (and (not (:done @state)) (< n 100)) (clotran.host.thread/sleep 50) (recur (inc n))))
+                (recur))))))
+      (finally
+        (clotran-kill pid)
+        (net/close conn)
+        (log "ended lldb-dap" pid)))))
+
+(defn main
+  "`clotran dap [--port N] [--verbose]`: over stdio, or one client on a
+  TCP port (0: a free one, named on stderr)."
+  [args]
+  (let [args (vec args)
+        port (some-> (second (drop-while #(not= % "--port") args)) parse-long)]
+    (swap! state assoc :verbose (boolean (some #{"--verbose"} args)))
+    (if port
+      (let [srv (net/listen port {:host "127.0.0.1"})]
+        (err (str "clotran dap: listening on port " (:port srv)))
+        (let [conn (loop [] (or (net/accept srv 1000) (recur)))]
+          (serve (rpc/socket conn))
+          (net/close conn)
+          (net/close srv)))
+      (serve (rpc/stdio)))
+    nil))

@@ -1,0 +1,73 @@
+;; test/dap_test.cljf -- clotran dap, stage one: the adapter serving a port
+;; in this process, driven by a client written with this package's own
+;; framing -- initialize, launch the fixture's debug.cljf, a function
+;; breakpoint on the package's Fortran subroutine, the stop, the stack with
+;; the Fortran frames and clotran's beneath them, the locals, disconnect.
+;; Skipped where there is no lldb-dap or no Fortran compiler. Run by
+;; test/run.sh, which names the fixture project in LSP_TEST_PROJ.
+(require '[clotran.ide.dap :as dap] '[clotran.ide.rpc :as rpc] '[clotran.net :as net] '[clojure.string :as str])
+
+(def failures (atom 0))
+(defn check [label got want]
+  (if (= got want)
+    (println "ok   -" label)
+    (do (swap! failures inc) (println "FAIL -" label "\n  got: " (pr-str got) "\n  want:" (pr-str want)))))
+
+(def proj (or (clotran.host.system/getenv "LSP_TEST_PROJ")
+              (str (clotran.host.system/getProperty "user.dir") "/test/fixtures/proj")))
+
+(if-not (and (dap/find-backend) (do (require 'clotran.bind) ((resolve 'clotran.bind/fortran-compiler))))
+  (println "skipped: no lldb-dap or no Fortran compiler, the debug adapter not checked")
+  (let [srv (net/listen 0 {:host "127.0.0.1"})
+        _ (future (let [conn (loop [] (or (net/accept srv 1000) (recur)))]
+                    (try (dap/serve (rpc/socket conn))
+                         (catch clotran.host.throwable e (binding [*out* *err*] (println "the adapter:" (ex-message e)))))
+                    (net/close conn)))
+        c (net/connect "127.0.0.1" (:port srv))
+        t (rpc/socket c)
+        src (rpc/source t)
+        seqn (atom 0)
+        send! (fn [cmd args] (rpc/write-message t {"seq" (swap! seqn inc) "type" "request" "command" cmd "arguments" args}))
+        wait-for (fn [pred label]
+                   (loop [n 0]
+                     (let [m (rpc/read-message src)]
+                       (cond (nil? m) (throw (ex-info (str "the stream ended before " label) {}))
+                             (pred m) m
+                             (> n 20000) (throw (ex-info (str "no " label) {}))
+                             :else (recur (inc n))))))
+        response (fn [cmd] (wait-for #(and (= "response" (get % "type")) (= cmd (get % "command"))) (str "the " cmd " response")))
+        request! (fn [cmd args] (send! cmd args) (response cmd))]
+    (check "initialize answers"
+           (get (request! "initialize" {"clientID" "clotran-ide-test" "adapterID" "clotran" "linesStartAt1" true "columnsStartAt1" true "pathFormat" "path"}) "success")
+           true)
+    (check "and the backend is named, once"
+           (get-in (wait-for #(= "output" (get % "event")) "the backend's name") ["body" "output"])
+           "clotran dap: using lldb-dap\n")
+    (send! "launch" {"program" "debug.cljf" "cwd" proj})
+    (wait-for #(= "initialized" (get % "event")) "initialized")
+    (request! "setFunctionBreakpoints" {"breakpoints" [{"name" "__mylib_MOD_scale"}]})
+    (request! "configurationDone" {})
+    (let [stopped (wait-for #(= "stopped" (get % "event")) "the stop")
+          tid (get-in stopped ["body" "threadId"])
+          frames (get-in (request! "stackTrace" {"threadId" tid "levels" 20}) ["body" "stackFrames"])
+          names (mapv #(get % "name") frames)]
+      (check "stopped at the breakpoint" (get-in stopped ["body" "reason"]) "breakpoint")
+      (check "the stack: the Fortran subroutine, its shim, clotran's package call and evaluator beneath"
+             [(first names) (second names)
+              (boolean (some #(str/includes? % "pkg_call") names)) (boolean (some #(str/includes? % "gce_eval") names))]
+             ["__mylib_MOD_scale" "mylib_scale_shim" true true])
+      ;; the source position comes from the objects clotran bind keeps beside
+      ;; the library; the LOCALS do not yet: Apple's lldb has no Fortran
+      ;; plugin and shows none -- clotran decoding them from their DWARF
+      ;; locations is the next stage (PLAN 31a)
+      (check "the stop has its source: mylib.f90, the line of x = a * x"
+             [(last (str/split (str (get-in (first frames) ["source" "path"])) #"/")) (get (first frames) "line")]
+             ["mylib.f90" 8])
+      (let [scopes (get-in (request! "scopes" {"frameId" (get (first frames) "id")}) ["body" "scopes"])]
+        (check "scopes answer, locals among them" (boolean (some #(= "Locals" (get % "name")) scopes)) true)))
+    (check "disconnect ends the session" (get (request! "disconnect" {"terminateDebuggee" true}) "success") true)
+    (net/close c)
+    (net/close srv)))
+
+(println (if (zero? @failures) "DAP TEST PASSED" (str "DAP TEST FAILED: " @failures)))
+(when (pos? @failures) (clotran.host.system/exit 1))

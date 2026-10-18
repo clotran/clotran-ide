@@ -1,3 +1,4 @@
 .clotran-cache/
 .cpcache/
 .nrepl-port
+.clj-kondo/.cache/
