@@ -1,0 +1,5 @@
+;; clotran-ide: the language server (clotran lsp) and, to come, the debug
+;; adapter (clotran dap) for clotran. Provided libraries
+;; (org.clojure/clojure) are clotran itself; see clotran's PACKAGES.md.
+{:paths ["src"]
+ :deps {org.clojure/clojure {:mvn/version "1.12.6"}}}

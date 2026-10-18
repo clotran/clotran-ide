@@ -1,0 +1,11 @@
+;; scripts/json_echo.cljf -- run by scripts/fuzz-json: the JSON in $JSON_IN
+;; read and written again to $JSON_OUT; each line of $JSON_BAD read on its
+;; own, "ok" or "error: ..." a line to $JSON_BAD_OUT.
+(require '[clotran.ide.json :as json] '[clojure.string :as str])
+(let [getenv #(clotran.host.system/getenv %)]
+  (spit (getenv "JSON_OUT") (json/write-str (json/read-str (slurp (getenv "JSON_IN")))))
+  (when-let [bad (getenv "JSON_BAD")]
+    (spit (getenv "JSON_BAD_OUT")
+          (str/join "\n" (for [l (str/split-lines (slurp bad))]
+                           (try (json/read-str l) "ok"
+                                (catch clotran.host.exception e (str "error: " (ex-message e)))))))))

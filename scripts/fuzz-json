@@ -1,0 +1,89 @@
+#!/usr/bin/env bb
+;; scripts/fuzz-json [N] [SEED] -- N random JSON values, written by cheshire,
+;; read and written again by clotran.ide.json (scripts/json_echo.cljf), read
+;; back by cheshire: every value must come back equal. Then N texts each
+;; broken in one place: whatever cheshire refuses, clotran must refuse too,
+;; with an error and no crash. cheshire is bb's own JSON, the oracle here.
+(require '[cheshire.core :as json]
+         '[babashka.process :as p]
+         '[babashka.fs :as fs]
+         '[clojure.string :as str])
+
+(def n (parse-long (or (first *command-line-args*) "300")))
+(def seed (or (some-> (second *command-line-args*) parse-long) (System/nanoTime)))
+(def rnd (java.util.Random. seed))
+(defn pick [& xs] (nth xs (.nextInt rnd (count xs))))
+(defn rint [k] (.nextInt rnd k))
+
+(def here (str (fs/parent (fs/parent (fs/absolutize *file*)))))
+(def clotran (or (System/getenv "CLOTRAN") (str here "/../clotran")))
+
+(defn rchar []
+  (let [c (case (rint 8)
+            0 (+ 32 (rint 95))                       ; printable ASCII
+            1 (rint 32)                              ; a control character
+            2 (pick 34 92 47)                        ; " \ /
+            3 (+ 0xA0 (rint 0x60))                   ; Latin-1
+            4 (+ 0x4E00 (rint 0x100))                ; CJK
+            5 (+ 0x1F600 (rint 0x50))                ; outside the BMP
+            (+ 97 (rint 26)))]
+    (String. (Character/toChars c))))
+(defn rstring [] (apply str (repeatedly (rint 12) rchar)))
+(defn rnumber []
+  (case (rint 4)
+    0 (long (- (rint 2000) 1000))
+    1 (- (.nextLong rnd) 0)
+    2 (* (- (.nextDouble rnd) 0.5) (Math/pow 10 (- (rint 40) 20)))
+    (double (- (rint 100) 50))))
+(defn gen [depth]
+  (case (if (> depth 3) (rint 4) (rint 6))
+    0 (rstring)
+    1 (rnumber)
+    2 (pick true false nil)
+    3 nil
+    4 (vec (repeatedly (rint 5) #(gen (inc depth))))
+    (into {} (repeatedly (rint 5) (fn [] [(rstring) (gen (inc depth))])))))
+
+(def work (str (fs/create-temp-dir {:prefix "fuzz-json"})))
+(def cases (vec (repeatedly n #(gen 0))))
+(spit (str work "/in.json") (json/generate-string cases))
+
+;; texts broken in one place: a character dropped, doubled or replaced
+(def broken
+  (vec (for [c cases
+             :let [t (json/generate-string c)
+                   i (rint (max 1 (count t)))]
+             :when (pos? (count t))]
+         (case (rint 3)
+           0 (str (subs t 0 i) (subs t (min (count t) (inc i))))
+           1 (str (subs t 0 i) (subs t i (min (count t) (inc i))) (subs t i))
+           (str (subs t 0 i) (pick "\"" "}" "]" "," ":" "x" "\\" " ") (subs t (min (count t) (inc i))))))))
+(spit (str work "/bad.txt") (str/join "\n" (map #(str/replace % "\n" " ") broken)))
+
+(def r (p/shell {:continue true :out :string :err :string
+                 :extra-env {"CLOTRAN_PATH" (str here "/src")
+                             "JSON_IN" (str work "/in.json") "JSON_OUT" (str work "/out.json")
+                             "JSON_BAD" (str work "/bad.txt") "JSON_BAD_OUT" (str work "/bad.out")}
+                 :in ""}
+                (str clotran "/clotran-bin") (str clotran "/src/clj/clojure/core.clj") (str here "/scripts/json_echo.cljf")))
+(when-not (zero? (:exit r))
+  (println "clotran failed:" (:err r) (:out r))
+  (System/exit 1))
+
+(def back (json/parse-string (slurp (str work "/out.json"))))
+(def mismatches (keep-indexed (fn [i [a b]] (when-not (= a b) [i a b])) (map vector cases back)))
+(doseq [[i a b] (take 5 mismatches)]
+  (println "MISMATCH" i "\n  sent:" (pr-str a) "\n  back:" (pr-str b)))
+
+;; whatever cheshire refuses, clotran refuses
+(def cheshire-says (mapv #(try (json/parse-string %) :ok (catch Exception _ :error)) broken))
+(def clotran-says (mapv #(if (str/starts-with? % "error") :error :ok) (str/split-lines (slurp (str work "/bad.out")))))
+(def lenient (keep-indexed (fn [i [a b]] (when (and (= a :error) (= b :ok)) [i (nth broken i)])) (map vector cheshire-says clotran-says)))
+(doseq [[i t] (take 5 lenient)]
+  (println "ACCEPTED" i "which cheshire refuses:" (pr-str t)))
+
+(printf "fuzz-json: seed %d, %d values round-tripped, %d/%d broken texts refused as cheshire does (%d mismatches, %d accepted that cheshire refuses)\n"
+        seed n (- (count broken) (count lenient)) (count broken) (count mismatches) (count lenient))
+(flush)
+(fs/delete-tree work)
+(System/exit (if (and (empty? mismatches) (empty? lenient)) 0 1))

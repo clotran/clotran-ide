@@ -1,0 +1,156 @@
+;; test/lsp_test.cljf -- the language server, driven by a client written
+;; with this package's own JSON and framing. Run by test/run.sh three
+;; ways: in this process over memory (the default); LSP_TEST=write, the
+;; same requests framed into LSP_TEST_FILE for `clotran lsp` to answer
+;; over its standard input and output; LSP_TEST=check, that answer read
+;; from LSP_TEST_FILE and checked here. The fixture project is
+;; test/fixtures/proj (LSP_TEST_PROJ), on CLOTRAN_PATH, so each position
+;; the server answers is checked against the Var the loaded file makes:
+;; clotran's index is read, never evaluated, and the two must agree.
+(require '[clotran.ide.lsp :as lsp] '[clotran.ide.rpc :as rpc] '[clotran.io :as io] '[clojure.string :as str])
+
+(def failures (atom 0))
+(defn check [label got want]
+  (if (= got want)
+    (println "ok   -" label)
+    (do (swap! failures inc) (println "FAIL -" label "\n  got: " (pr-str got) "\n  want:" (pr-str want)))))
+
+(def mode (or (clotran.host.system/getenv "LSP_TEST") ""))
+(def proj (or (clotran.host.system/getenv "LSP_TEST_PROJ")
+              (str (clotran.host.system/getProperty "user.dir") "/test/fixtures/proj")))
+(defn path [rel] (str proj "/" rel))
+(defn uri [rel] (lsp/path->uri (path rel)))
+(def core-text (slurp (path "src/app/core.cljf")))
+(def broken-text "(ns t.x (:require [app.util :as u]))\n(u/sh\n")
+
+(defn utf16-len [s] (reduce (fn [n c] (+ n (if (> (int c) 0xFFFF) 2 1))) 0 s))
+(defn pos-of
+  "The LSP position of the first needle in text, skip characters in."
+  [text needle & [skip]]
+  (let [i (+ (str/index-of text needle) (or skip 0))
+        ls (str/split (subs text 0 i) #"\n" -1)]
+    {"line" (dec (count ls)) "character" (utf16-len (last ls))}))
+
+(defn req [id method params] {"jsonrpc" "2.0" "id" id "method" method "params" params})
+(defn note [method params] {"jsonrpc" "2.0" "method" method "params" params})
+(def core-doc {"textDocument" {"uri" (uri "src/app/core.cljf")}})
+(def mylib-doc {"textDocument" {"uri" (uri "src/mylib/mylib.f90")}})
+
+(def requests
+  [(req 1 "initialize" {"rootUri" (lsp/path->uri proj) "capabilities" {}})
+   (note "initialized" {})
+   (note "textDocument/didOpen" {"textDocument" {"uri" (uri "src/app/core.cljf") "languageId" "clojure" "version" 1 "text" core-text}})
+   (req 2 "textDocument/definition" (assoc core-doc "position" (pos-of core-text "u/shout" 3)))
+   (req 3 "textDocument/definition" (assoc core-doc "position" (pos-of core-text "(twice 2)" 1)))
+   (req 4 "textDocument/definition" (assoc core-doc "position" (pos-of core-text "(map inc" 1)))
+   (req 5 "textDocument/definition" (assoc core-doc "position" (pos-of core-text "mylib.raw/scale" 12)))
+   (req 6 "textDocument/hover" (assoc core-doc "position" (pos-of core-text "u/shout" 2)))
+   (req 7 "textDocument/documentSymbol" core-doc)
+   (req 8 "workspace/symbol" {"query" "shou"})
+   (req 9 "clotran/formAtPoint" (assoc core-doc "position" (pos-of core-text "(u/shout")))
+   (req 10 "clotran/namespace" core-doc)
+   (note "textDocument/didChange" {"textDocument" {"uri" (uri "src/app/core.cljf") "version" 2}
+                                   "contentChanges" [{"text" broken-text}]})
+   (req 11 "textDocument/completion" (assoc core-doc "position" (pos-of broken-text "u/sh" 4)))
+   (note "textDocument/didOpen" {"textDocument" {"uri" (uri "src/fortran/bad.f90") "languageId" "fortran" "version" 1 "text" (slurp (path "src/fortran/bad.f90"))}})
+   (note "textDocument/didOpen" {"textDocument" {"uri" (uri "src/mylib/mylib.f90") "languageId" "fortran" "version" 1 "text" (slurp (path "src/mylib/mylib.f90"))}})
+   (req 12 "textDocument/definition" (assoc mylib-doc "position" (pos-of (slurp (path "src/mylib/mylib.f90")) "norm2sq = sum" 2)))
+   (req 13 "no/such" {})
+   (req 14 "shutdown" nil)
+   (note "exit" nil)])
+
+(defn concat-bytes [as]
+  (let [a (byte-array (reduce + (map alength as)))]
+    (loop [i 0 as as]
+      (when-let [b (first as)]
+        (dotimes [k (alength b)] (aset a (+ i k) (aget b k)))
+        (recur (+ i (alength b)) (rest as))))
+    a))
+
+(defn framed
+  "The messages as the bytes a client sends."
+  [ms]
+  (let [t (rpc/memory (byte-array 0))]
+    (doseq [m ms] (rpc/write-message t m))
+    (concat-bytes @(:out t))))
+
+(defn unframed
+  "Every message in the bytes a server sent."
+  [bytes]
+  (let [src (rpc/source (rpc/memory bytes))]
+    (loop [acc []]
+      (if-let [m (rpc/read-message src)] (recur (conj acc m)) acc))))
+
+(defn check-responses [msgs]
+  (let [by-id (into {} (for [m msgs :when (contains? m "id")] [(get m "id") m]))
+        result #(get (by-id %) "result")
+        diags (reduce (fn [acc m] (if (= "textDocument/publishDiagnostics" (get m "method"))
+                                   (update acc (get-in m ["params" "uri"]) (fnil conj []) (get-in m ["params" "diagnostics"]))
+                                   acc))
+                      {} msgs)
+        line-of (fn [v] (:line (meta v)))
+        _ (require 'app.util 'app.core)]
+    (check "initialize: the capabilities and the server's name"
+           [(get-in (result 1) ["capabilities" "definitionProvider"]) (get-in (result 1) ["capabilities" "hoverProvider"])
+            (get-in (result 1) ["serverInfo" "name"])]
+           [true true "clotran-ide"])
+    (check "definition of u/shout: app.util's file, the line the loaded Var has"
+           (-> (result 2) first (select-keys ["uri" "range"]))
+           {"uri" (uri "src/app/util.cljf") "range" (let [p {"line" (dec (line-of (resolve 'app.util/shout))) "character" 0}] {"start" p "end" p})})
+    (check "definition of a referred name, twice"
+           (-> (result 3) first (get-in ["range" "start" "line"]))
+           (dec (line-of (resolve 'app.util/twice))))
+    (check "definition of map, after a non-BMP character on the line: clojure.core's line"
+           [(str/ends-with? (-> (result 4) first (get "uri")) "clojure/core.clj")
+            (-> (result 4) first (get-in ["range" "start" "line"]))]
+           [true (dec (line-of #'clojure.core/map))])
+    (check "definition of mylib.raw/scale: the Fortran source, its subroutine line"
+           (-> (result 5) first (select-keys ["uri" "range"]))
+           {"uri" (uri "src/mylib/mylib.f90") "range" {"start" {"line" 3 "character" 0} "end" {"line" 3 "character" 0}}})
+    (check "hover on u/shout: signature and docstring"
+           (let [v (get-in (result 6) ["contents" "value"])]
+             [(str/includes? v "app.util/shout [s]") (str/includes? v "Louder.")])
+           [true true])
+    (check "documentSymbol: the file's definitions, with their namespace"
+           (set (map #(vector (get % "name") (get % "containerName")) (result 7)))
+           #{["app.core" nil] ["greet" "app.core"] ["counter" "app.core"] ["run" "app.core"]})
+    (check "workspace/symbol shou finds app.util/shout"
+           (some #(when (= "shout" (get % "name")) (get % "containerName")) (result 8))
+           "app.util")
+    (check "formAtPoint inside greet: the defn, from its line"
+           [(str/starts-with? (get (result 9) "text") "(defn greet") (get-in (result 9) ["range" "start"])]
+           [true (pos-of core-text "(defn greet")])
+    (check "the file's namespace" (result 10) {"ns" "app.core"})
+    (check "completion of u/sh in a buffer that does not read"
+           (some #{"u/shout"} (map #(get % "label") (get (result 11) "items")))
+           "u/shout")
+    (check "diagnostics: none for the file as saved, one where the broken buffer stops reading"
+           (let [ds (get diags (uri "src/app/core.cljf"))]
+             [(first ds) (count (second ds)) (get-in (second ds) [0 "severity"]) (get-in (second ds) [0 "range" "start" "line"])])
+           [[] 1 1 1])
+    (if-let [ds (get diags (uri "src/fortran/bad.f90"))]
+      (check "diagnostics for Fortran: the compiler's error, at its line"
+             (let [d (first (first ds))] [(get d "severity") (get-in d ["range" "start" "line"]) (string? (get d "message"))])
+             [1 5 true])
+      (println "note: no Fortran compiler, its diagnostics not checked"))
+    (check "definition from a Fortran file: the routine under the cursor"
+           (-> (result 12) first (get-in ["range" "start" "line"]))
+           10)
+    (check "an unknown method is -32601" (get-in (by-id 13) ["error" "code"]) -32601)
+    (check "shutdown answers null, and exit ends the session"
+           [(contains? (by-id 14) "result") (result 14) (= 14 (get (last (filter #(contains? % "id") msgs)) "id"))]
+           [true nil true])))
+
+(case mode
+  "write" (do (spit (clotran.host.system/getenv "LSP_TEST_FILE") (io/utf8-string (framed requests)))
+              (println "wrote" (count requests) "messages"))
+  "check" (check-responses (unframed (io/utf8-bytes (slurp (clotran.host.system/getenv "LSP_TEST_FILE")))))
+  (let [t (rpc/memory (framed requests))]
+    (lsp/serve t)
+    (check-responses (unframed (concat-bytes @(:out t))))))
+
+(when (= mode "")
+  (println (if (zero? @failures) "LSP TEST PASSED" (str "LSP TEST FAILED: " @failures))))
+(when (= mode "check")
+  (println (if (zero? @failures) "LSP STDIO TEST PASSED" (str "LSP STDIO TEST FAILED: " @failures))))
+(when (pos? @failures) (clotran.host.system/exit 1))

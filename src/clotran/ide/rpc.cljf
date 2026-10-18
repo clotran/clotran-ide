@@ -1,0 +1,132 @@
+(ns clotran.ide.rpc
+  "JSON-RPC over the base protocol the language server protocol and the
+  debug adapter protocol share: a header part -- `Content-Length: N`,
+  perhaps a Content-Type, a blank line, each line ended by \\r\\n -- then
+  N BYTES of UTF-8 JSON. Bytes, so the text is decoded only once its
+  length is known.
+
+  A transport is a map of two functions over byte arrays, {:read (fn
+  [buf off len] -> n, -1 at the end) :write (fn [buf off len])}: this
+  process's own stdio (clotran's clotran-stdin-read-bytes and
+  clotran-stdout-write-bytes), a clotran.net connection, or, for a test,
+  memory."
+  (:require [clojure.string :as str]
+            [clotran.ide.json :as json]
+            [clotran.io :as io]
+            [clotran.net :as net]))
+
+;;; ---- transports --------------------------------------------------------------
+
+(defn stdio
+  "This process's standard input and output."
+  []
+  {:read (fn [buf off len] (clotran-stdin-read-bytes buf off len))
+   :write (fn [buf off len] (clotran-stdout-write-bytes buf off len))})
+
+(defn socket
+  "A clotran.net connection."
+  [conn]
+  {:read (fn [buf off len] (net/read-bytes conn buf off len -1))
+   :write (fn [buf off len] (net/write-bytes conn buf off len))})
+
+(defn memory
+  "A transport over memory, for tests: it reads the bytes of input (a byte
+  array) and keeps what is written in :out, an atom of byte arrays."
+  [input]
+  (let [pos (atom 0) out (atom [])]
+    {:read (fn [buf off len]
+             (let [n (min len (- (alength input) @pos))]
+               (if (pos? n)
+                 (do (dotimes [i n] (aset buf (+ off i) (aget input (+ @pos i))))
+                     (swap! pos + n)
+                     n)
+                 -1)))
+     :write (fn [buf off len]
+              (let [a (byte-array len)]
+                (dotimes [i len] (aset a i (aget buf (+ off i))))
+                (swap! out conj a)))
+     :out out}))
+
+;;; ---- reading messages ----------------------------------------------------------
+
+(defn source
+  "A buffered byte source over a transport."
+  [t]
+  {:t t :buf (byte-array 65536) :pos (atom 0) :lim (atom 0)})
+
+(defn- next-byte
+  "The next byte, or nil at the end."
+  [{:keys [t buf pos lim]}]
+  (when (>= @pos @lim)
+    (let [n ((:read t) buf 0 (alength buf))]
+      (reset! pos 0)
+      (reset! lim (max n 0))))
+  (when (< @pos @lim)
+    (let [b (aget buf @pos)] (swap! pos inc) b)))
+
+(defn- read-n
+  "Exactly n bytes, or nil if the stream ends first."
+  [src n]
+  (let [out (byte-array n)]
+    (loop [i 0]
+      (if (< i n)
+        (when-let [b (next-byte src)]
+          (aset out i (byte b))
+          (recur (inc i)))
+        out))))
+
+(defn- read-line*
+  "The bytes up to the next \\n as a string, the \\r\\n taken off; nil at
+  the end of the stream."
+  [src]
+  (let [sb (clotran.host.string_builder.)]
+    (loop [any? false]
+      (let [b (next-byte src)]
+        (cond (nil? b) (when any? (str sb))
+              (= b 10) (str/replace (str sb) #"\r$" "")
+              :else (do (.append sb (char (bit-and b 255))) (recur true)))))))
+
+(defn read-message
+  "The next message from src as read by clotran.ide.json, or nil at the end
+  of the stream. A header part without a Content-Length is an error."
+  [src]
+  (loop [len nil]
+    (let [line (read-line* src)]
+      (cond
+        (nil? line) nil
+        (str/blank? line)
+        (if len
+          (when-let [body (read-n src len)]
+            (json/read-str (io/utf8-string body)))
+          ;; nothing before the blank line: keep reading
+          (recur nil))
+        :else
+        (let [[k v] (str/split line #":" 2)]
+          (recur (if (and v (= "content-length" (str/lower-case (str/trim k))))
+                   (parse-long (str/trim v))
+                   len)))))))
+
+;;; ---- writing messages ----------------------------------------------------------
+
+(defn write-message
+  "m as one message: the header, then its JSON, in one write."
+  [t m]
+  (let [body (io/utf8-bytes (json/write-str m))
+        head (io/utf8-bytes (str "Content-Length: " (alength body) "\r\n\r\n"))
+        all (byte-array (+ (alength head) (alength body)))]
+    (dotimes [i (alength head)] (aset all i (aget head i)))
+    (dotimes [i (alength body)] (aset all (+ (alength head) i) (aget body i)))
+    ((:write t) all 0 (alength all))
+    nil))
+
+;;; ---- the loop ----------------------------------------------------------------
+
+(defn serve
+  "Every message from the transport handed to (handler message) until the
+  stream ends or the handler answers false."
+  [t handler]
+  (let [src (source t)]
+    (loop []
+      (when-let [m (read-message src)]
+        (when-not (false? (handler m))
+          (recur))))))

@@ -1,0 +1,209 @@
+(ns clotran.ide.json
+  "JSON, RFC 8259, read and written: what the language server protocol
+  and the debug adapter protocol carry. An object reads as a map with
+  string keys, an array as a vector, a number as a long when it is
+  written as an integer and as a double otherwise, true, false and null
+  as themselves. Written: a map's keys by name (strings, keywords and
+  symbols), any sequential as an array, nil as null, every other number
+  by its text. Strings are escaped as the RFC asks and no further: the
+  bytes out are UTF-8, which is what the protocols count.
+
+  The oracle is clojure.data.json on clj (test/run.sh, scripts/fuzz-json)."
+  (:require [clojure.string :as str]))
+
+;;; ---- writing ----------------------------------------------------------------
+
+(defn- escape
+  "s between quotes: \\\" \\\\ and the control characters by their short
+  escapes, every other character below 32 as \\u00XX, the rest as it is."
+  [^clotran.host.string_builder sb s]
+  (.append sb \")
+  (if-not (re-find #"[\"\\\\\x00-\x1f]" s)
+    (.append sb s)
+    (doseq [c s]
+    (let [i (int c)]
+      (cond (= c \") (.append sb "\\\"")
+            (= c \\) (.append sb "\\\\")
+            (= i 10) (.append sb "\\n")
+            (= i 13) (.append sb "\\r")
+            (= i 9) (.append sb "\\t")
+            (= i 8) (.append sb "\\b")
+            (= i 12) (.append sb "\\f")
+            (< i 32) (.append sb (str "\\u00" (if (< i 16) "0" "") (clotran.host.int8/toString i 16)))
+            :else (.append sb c)))))
+  (.append sb \"))
+
+(defn- key-name [k]
+  (cond (string? k) k
+        (or (keyword? k) (symbol? k)) (if-let [n (namespace k)] (str n "/" (name k)) (name k))
+        :else (str k)))
+
+(defn- write-value [^clotran.host.string_builder sb x]
+  (cond
+    (nil? x) (.append sb "null")
+    (true? x) (.append sb "true")
+    (false? x) (.append sb "false")
+    (string? x) (escape sb x)
+    (or (keyword? x) (symbol? x)) (escape sb (key-name x))
+    (char? x) (escape sb (str x))
+    (integer? x) (.append sb (str x))
+    (number? x) (if (or (clotran.host.real8/isNaN x) (clotran.host.real8/isInfinite x))
+                  (throw (ex-info (str "json: " x " cannot be written") {:value x}))
+                  (.append sb (str x)))
+    (map? x) (do (.append sb \{)
+                 (loop [es (seq x) first? true]
+                   (when-let [[k v] (first es)]
+                     (when-not first? (.append sb \,))
+                     (escape sb (key-name k))
+                     (.append sb \:)
+                     (write-value sb v)
+                     (recur (rest es) false)))
+                 (.append sb \}))
+    (or (sequential? x) (set? x)) (do (.append sb \[)
+                                      (loop [es (seq x) first? true]
+                                        (when (seq es)
+                                          (when-not first? (.append sb \,))
+                                          (write-value sb (first es))
+                                          (recur (rest es) false)))
+                                      (.append sb \]))
+    :else (throw (ex-info (str "json: no JSON for " (type x)) {:value x}))))
+
+(defn write-str
+  "x as JSON text, compact."
+  [x]
+  (let [sb (clotran.host.string_builder.)]
+    (write-value sb x)
+    (str sb)))
+
+;;; ---- reading ----------------------------------------------------------------
+;;
+;; A cursor over the text: the string and an index. Characters are code
+;; points, so a non-BMP character is one step.
+
+(defn- fail [s i what] (throw (ex-info (str "json: " what " at " i) {:text s :at i})))
+
+(defn- skip-ws [s i]
+  (let [n (count s)]
+    (loop [i i]
+      (if (and (< i n) (#{\space \tab \newline \return} (nth s i))) (recur (inc i)) i))))
+
+(declare read-value)
+
+(def ^:private hex-digit
+  (zipmap "0123456789abcdefABCDEF" (concat (range 10) (range 10 16) (range 10 16))))
+
+(defn- hex4 [s i]
+  (when (> (+ i 4) (count s)) (fail s i "a \\u escape ends early"))
+  (reduce (fn [v c] (if-let [d (hex-digit c)] (+ (* v 16) d) (fail s i "a \\u escape wants four hex digits")))
+          0 (subs s i (+ i 4))))
+
+(defn- read-string* [s i]
+  ;; i is just past the opening quote; answers [string, index past the closing one]
+  (let [n (count s) sb (clotran.host.string_builder.)
+        ;; the plain run before the first quote, escape or control
+        ;; character goes in as one subs, not a character at a time
+        ;; (ponytail: still a character loop in Clojure; a host scan if
+        ;; large documents make it show)
+        e (loop [j i]
+            (if (< j n)
+              (let [c (nth s j)]
+                (if (or (= c \") (= c \\) (< (int c) 32)) j (recur (inc j))))
+              j))]
+    (when (> e i) (.append sb (subs s i e)))
+    (loop [i e]
+      (when (>= i n) (fail s i "a string has no end"))
+      (let [c (nth s i)]
+        (cond
+          (= c \") [(str sb) (inc i)]
+          (= c \\) (do (when (>= (inc i) n) (fail s i "a string has no end"))
+                       (let [e (nth s (inc i))]
+                         (case e
+                           \" (do (.append sb \") (recur (+ i 2)))
+                           \\ (do (.append sb \\) (recur (+ i 2)))
+                           \/ (do (.append sb \/) (recur (+ i 2)))
+                           \b (do (.append sb (char 8)) (recur (+ i 2)))
+                           \f (do (.append sb (char 12)) (recur (+ i 2)))
+                           \n (do (.append sb \newline) (recur (+ i 2)))
+                           \r (do (.append sb \return) (recur (+ i 2)))
+                           \t (do (.append sb \tab) (recur (+ i 2)))
+                           \u (let [u (hex4 s (+ i 2))]
+                                ;; a high surrogate followed by \uDCxx is one character
+                                (if (and (<= 0xD800 u 0xDBFF) (<= (+ i 12) n)
+                                         (= \\ (nth s (+ i 6))) (= \u (nth s (+ i 7))))
+                                  (let [lo (hex4 s (+ i 8))]
+                                    (if (<= 0xDC00 lo 0xDFFF)
+                                      (do (.append sb (char (+ 0x10000 (bit-shift-left (- u 0xD800) 10) (- lo 0xDC00))))
+                                          (recur (+ i 12)))
+                                      (do (.append sb (char u)) (recur (+ i 6)))))
+                                  (do (.append sb (char u)) (recur (+ i 6)))))
+                           (fail s i (str "an unknown escape \\" e)))))
+          (< (int c) 32) (fail s i "a control character inside a string")
+          :else (do (.append sb c) (recur (inc i))))))))
+
+(defn- read-number [s i]
+  (let [n (count s)
+        j (loop [j i] (if (and (< j n) (#{\- \+ \. \e \E \0 \1 \2 \3 \4 \5 \6 \7 \8 \9} (nth s j))) (recur (inc j)) j))
+        t (subs s i j)]
+    (when-not (re-matches #"-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][-+]?[0-9]+)?" t) (fail s i (str "not a number: " t)))
+    [(if (re-find #"[.eE]" t)
+       (parse-double t)
+       (or (parse-long t) (bigint t)))
+     j]))
+
+(defn- read-array [s i]
+  ;; i past the [
+  (let [i (skip-ws s i)]
+    (if (and (< i (count s)) (= \] (nth s i)))
+      [[] (inc i)]
+      (loop [i i acc (transient [])]
+        (let [[v i] (read-value s i)
+              acc (conj! acc v)
+              i (skip-ws s i)
+              c (when (< i (count s)) (nth s i))]
+          (cond (= c \,) (recur (skip-ws s (inc i)) acc)
+                (= c \]) [(persistent! acc) (inc i)]
+                :else (fail s i "an array wants , or ]")))))))
+
+(defn- read-object [s i]
+  ;; i past the {
+  (let [i (skip-ws s i)]
+    (if (and (< i (count s)) (= \} (nth s i)))
+      [{} (inc i)]
+      (loop [i i acc (transient {})]
+        (when-not (and (< i (count s)) (= \" (nth s i))) (fail s i "an object's key is a string"))
+        (let [[k i] (read-string* s (inc i))
+              i (skip-ws s i)
+              _ (when-not (and (< i (count s)) (= \: (nth s i))) (fail s i "a key wants :"))
+              [v i] (read-value s (skip-ws s (inc i)))
+              acc (assoc! acc k v)
+              i (skip-ws s i)
+              c (when (< i (count s)) (nth s i))]
+          (cond (= c \,) (recur (skip-ws s (inc i)) acc)
+                (= c \}) [(persistent! acc) (inc i)]
+                :else (fail s i "an object wants , or }")))))))
+
+(defn- literal [s i word value]
+  (let [j (+ i (count word))]
+    (if (and (<= j (count s)) (= word (subs s i j))) [value j] (fail s i (str "not " word)))))
+
+(defn- read-value [s i]
+  (let [i (skip-ws s i)]
+    (when (>= i (count s)) (fail s i "the text ends before a value"))
+    (let [c (nth s i)]
+      (cond (= c \{) (read-object s (inc i))
+            (= c \[) (read-array s (inc i))
+            (= c \") (read-string* s (inc i))
+            (= c \t) (literal s i "true" true)
+            (= c \f) (literal s i "false" false)
+            (= c \n) (literal s i "null" nil)
+            (or (= c \-) (<= 48 (int c) 57)) (read-number s i)
+            :else (fail s i (str "an unexpected character " c))))))
+
+(defn read-str
+  "The one JSON value the text holds; an error names where it stops
+  being JSON."
+  [s]
+  (let [[v i] (read-value s 0)
+        i (skip-ws s i)]
+    (when (< i (count s)) (fail s i "text after the value"))
+    v))

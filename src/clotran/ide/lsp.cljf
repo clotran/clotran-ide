@@ -1,0 +1,537 @@
+(ns clotran.ide.lsp
+  "clotran's language server: `clotran lsp` (clotran's PLAN step 36).
+  Definitions, hover documentation, symbols, completion and errors for a
+  project's Clojure files and the Fortran of its packages, with no REPL:
+  everything comes from clotran's index (clotran.index), read by the
+  reader that loads the code, so a position here is the one the loaded
+  Var answers.
+
+  The protocol is the language server protocol, 3.17, over this
+  process's standard input and output, as every editor's client expects
+  -- or a TCP port (--port N). What a client gets:
+
+    initialize, initialized, shutdown, exit
+    textDocument/didOpen didChange (whole text) didSave didClose
+    textDocument/definition hover documentSymbol completion
+    workspace/symbol
+    textDocument/publishDiagnostics: what the reader refused, with its
+      line and column; for Fortran, the compiler's syntax check on save
+
+  and two requests of clotran's own, so an editor's client stays thin:
+
+    clotran/formAtPoint {textDocument position} -> {text range}: the
+      top-level form around the position, for evaluating at the cursor
+    clotran/namespace {textDocument} -> {ns}: the file's namespace
+
+  Positions on the wire are LSP's: a line from 0, a character in UTF-16
+  units; the index counts lines from 1 and characters as the reader
+  does, so each is converted against the line's text."
+  (:require [clojure.string :as str]
+            [clotran.ide.rpc :as rpc]
+            [clotran.index :as index]
+            [clotran.bind :as bind]
+            [clotran.net :as net]))
+
+(defonce ^:private state
+  (atom {:roots [] :by-file {} :docs {} :verbose false}))
+
+(defn- err [& xs] (binding [*out* *err*] (apply println xs) (flush)))
+(defn- log [& xs] (when (:verbose @state) (apply err "clotran lsp:" xs)))
+
+(def ^:private windows? (str/starts-with? (str (clotran.host.system/getProperty "os.name")) "Windows"))
+
+;;; ---- paths and URIs ------------------------------------------------------------
+
+(def ^:private hex (zipmap "0123456789abcdefABCDEF" (concat (range 10) (range 10 16) (range 10 16))))
+
+(defn- percent-decode
+  "%XX sequences as the UTF-8 bytes they are."
+  [s]
+  (if-not (str/includes? s "%")
+    s
+    (let [bs (clotran.host.string_builder.)
+          out (atom [])]
+      (loop [i 0]
+        (when (< i (count s))
+          (let [c (nth s i)]
+            (if (and (= c \%) (<= (+ i 3) (count s)) (hex (nth s (+ i 1))) (hex (nth s (+ i 2))))
+              (do (swap! out conj (byte (let [v (+ (* 16 (hex (nth s (+ i 1)))) (hex (nth s (+ i 2))))] (if (> v 127) (- v 256) v))))
+                  (recur (+ i 3)))
+              (do (doseq [b (clotran.io/utf8-bytes (str c))] (swap! out conj b))
+                  (recur (inc i)))))))
+      (let [a (byte-array (count @out))]
+        (dotimes [i (count @out)] (aset a i (byte (nth @out i))))
+        (.append bs (clotran.io/utf8-string a))
+        (str bs)))))
+
+(defn uri->path
+  "file:///a/b%20c -> /a/b c; file:///C:/x -> C:/x."
+  [uri]
+  (let [p (percent-decode (str/replace-first uri #"^file://" ""))]
+    (if (re-find #"^/[A-Za-z]:" p) (subs p 1) p)))
+
+(def ^:private unreserved (set "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/:"))
+
+(defn path->uri [path]
+  (let [p (str/replace path "\\" "/")
+        sb (clotran.host.string_builder.)]
+    (doseq [c p]
+      (if (unreserved c)
+        (.append sb c)
+        (doseq [b (clotran.io/utf8-bytes (str c))]
+          (.append sb (str "%" (str/upper-case (clotran.host.int8/toString (bit-and b 255) 16)))))))
+    (str "file://" (when-not (str/starts-with? p "/") "/") (str sb))))
+
+(defn- absolute [p]
+  (if (re-find #"^(/|[A-Za-z]:[/\\])" p) p (str (clotran.host.system/getProperty "user.dir") "/" p)))
+
+(defn- lang-of [path]
+  (cond (re-find #"\.(cljf|cljc|clj)$" path) :clojure
+        (re-find #"(?i)\.(f90|f95|f03|f08|f18|f|for)$" path) :fortran
+        :else nil))
+
+;;; ---- the index ---------------------------------------------------------------
+
+(defn- all-defs [] (apply concat (vals (:by-file @state))))
+
+(defn- package-dir
+  "The directory with a package.edn that holds the Fortran file: its own
+  or, within two levels, a parent's."
+  [path]
+  (loop [dir (str/replace path #"/[^/]*$" "") n 0]
+    (cond (clotran-file-exists? (str dir "/package.edn")) dir
+          (or (> n 2) (not (str/includes? dir "/"))) nil
+          :else (recur (str/replace dir #"/[^/]*$" "") (inc n)))))
+
+(defn- reindex!
+  "The file's definitions read again, from text when the editor holds it;
+  a Fortran file's whole package, since its routines share one namespace."
+  [path text]
+  (case (lang-of path)
+    :clojure (swap! state assoc-in [:by-file path] (index/index-file path text))
+    :fortran (when-let [dir (package-dir path)]
+               (let [texts (into (when text {path text})
+                                 (for [[p d] (:docs @state) :when (and (= :fortran (lang-of p)) (= dir (package-dir p)))] [p (:text d)]))
+                     defs (try (index/fortran-defs dir texts)
+                               (catch clotran.host.throwable e (log "package" dir (ex-message e)) nil))]
+                 (when defs
+                   (swap! state update :by-file #(into % (group-by :file defs))))))
+    nil))
+
+(defn- index-roots! []
+  (let [roots (mapv absolute (filter clotran-file-exists? (index/project-roots)))
+        defs (index/index-paths roots)]
+    (swap! state assoc :roots roots :by-file (group-by :file defs))
+    (log "indexed" (count defs) "definitions under" (pr-str roots))))
+
+;;; ---- text, lines and positions -----------------------------------------------------
+
+(defn- lines [text] (str/split text #"\n" -1))
+
+(defn- line-text
+  "Line n (from 0) of the open document at path, or of the file."
+  [path n]
+  (let [text (or (get-in @state [:docs path :text])
+                 (try (clotran-slurp path) (catch clotran.host.throwable _ "")))]
+    (nth (lines text) n "")))
+
+(defn- utf16-length [s] (reduce (fn [n c] (+ n (if (> (int c) 0xFFFF) 2 1))) 0 s))
+
+(defn- col->utf16
+  "A column in characters (from 0) on line as UTF-16 units."
+  [line col]
+  (utf16-length (subs line 0 (min col (count line)))))
+
+(defn- utf16->col
+  "A UTF-16 offset on line as a column in characters."
+  [line ch]
+  (loop [i 0 u 0]
+    (if (or (>= i (count line)) (>= u ch))
+      i
+      (recur (inc i) (+ u (if (> (int (nth line i)) 0xFFFF) 2 1))))))
+
+(defn- position
+  "An index position (1-based line and column) as an LSP position."
+  [path line column]
+  (let [l (dec (or line 1))]
+    {:line l :character (col->utf16 (line-text path l) (dec (or column 1)))}))
+
+(defn- location [{:keys [file line column]}]
+  (let [p (position file line column)]
+    {:uri (path->uri file) :range {:start p :end p}}))
+
+(def ^:private delimiters (set "()[]{}\";,`~@^\\ \t\n\r"))
+
+(defn- token-at
+  "The symbol-like token around column col (characters) of line: [text
+  start end], the reader prefixes (' # ` ~ @ ^) taken off the front."
+  [line col]
+  (let [n (count line)
+        col (min col n)
+        sym? #(not (delimiters (nth line %)))]
+    (when (or (and (< col n) (sym? col)) (and (pos? col) (sym? (dec col))))
+      (let [start (loop [i col] (if (and (pos? i) (sym? (dec i))) (recur (dec i)) i))
+            end (loop [i col] (if (and (< i n) (sym? i)) (recur (inc i)) i))
+            raw (subs line start end)
+            text (str/replace raw #"^[#'`~@^]+" "")]
+        [text (+ start (- (count raw) (count text))) end]))))
+
+(defn- fortran-word-at [line col]
+  (let [n (count line) col (min col n)
+        w? #(re-matches #"[A-Za-z0-9_]" (str (nth line %)))]
+    (when (or (and (< col n) (w? col)) (and (pos? col) (w? (dec col))))
+      (let [start (loop [i col] (if (and (pos? i) (w? (dec i))) (recur (dec i)) i))
+            end (loop [i col] (if (and (< i n) (w? i)) (recur (inc i)) i))]
+        [(subs line start end) start end]))))
+
+;;; ---- a file's namespace -------------------------------------------------------
+
+(defn- libspecs
+  "Every [lib opts-map] a :require clause names, prefix lists expanded."
+  [clause]
+  (cond (symbol? clause) [[clause {}]]
+        (vector? clause) (if (and (symbol? (first clause)) (or (keyword? (second clause)) (nil? (second clause))))
+                           [[(first clause) (apply hash-map (rest clause))]]
+                           ;; a prefix list written as a vector
+                           (for [c (rest clause) [l o] (libspecs c)] [(symbol (str (first clause) "." l)) o]))
+        (seq? clause) (for [c (rest clause) [l o] (libspecs c)] [(symbol (str (first clause) "." l)) o])
+        :else nil))
+
+(defn- ns-info
+  "{:ns :aliases {\"a\" lib} :refers {\"f\" lib}} from the file's ns form,
+  read as the loader reads it; when the text does not read, from the
+  text itself, as far as a pattern sees."
+  [path text]
+  (let [forms (try (binding [*ns* (the-ns 'user)] (clotran-read-forms path true text))
+                   (catch clotran.host.throwable _ nil))
+        form (first (filter #(and (seq? %) (= 'ns (first %)) (symbol? (second %))) forms))]
+    (if form
+      (let [reqs (mapcat rest (filter #(and (seq? %) (= :require (first %))) (drop 2 form)))
+            specs (mapcat libspecs reqs)]
+        {:ns (second form)
+         :aliases (into {} (for [[l o] specs :when (:as o)] [(name (:as o)) l]))
+         :refers (into {} (for [[l o] specs :when (sequential? (:refer o)) r (:refer o)] [(name r) l]))})
+      {:ns (some-> (re-find #"\(ns\s+([^\s\)\[\]\{\}\"]+)" text) second symbol)
+       :aliases (into {} (for [[_ l a] (re-seq #"\[([^\s\[\]\"]+)\s+:as\s+([^\s\]\)]+)" text)] [a (symbol l)]))
+       :refers {}})))
+
+;;; ---- resolving a symbol ----------------------------------------------------------
+
+(defn- lookup
+  "The definitions of ns/name, a declaration after the definition it
+  announces."
+  [ns-sym name-sym]
+  (sort-by #(if (= :declare (:kind %)) 1 0)
+           (filter #(and (= (:ns %) ns-sym) (= (:name %) name-sym)) (all-defs))))
+
+(defn- resolve-symbol
+  "The definitions a symbol's text may mean in the file: by its alias or
+  namespace, else in the file's namespace, what it refers, clojure.core,
+  and last anywhere."
+  [path text sym]
+  (let [{:keys [ns aliases refers]} (ns-info path text)]
+    (cond
+      (or (str/blank? sym) (str/starts-with? sym ":") (= sym "/")) nil
+      (str/includes? sym "/")
+      (let [[a n] (str/split sym #"/" 2)
+            nm (symbol n)]
+        (seq (distinct (concat (when-let [l (get aliases a)] (lookup l nm))
+                               (lookup (symbol a) nm)))))
+      :else
+      (let [nm (symbol sym)]
+        (or (seq (when ns (lookup ns nm)))
+            (seq (when-let [l (get refers sym)] (lookup l nm)))
+            (seq (lookup 'clojure.core nm))
+            (seq (filter #(= (:name %) nm) (all-defs))))))))
+
+(defn- fortran-routines [word]
+  (let [w (str/lower-case (bind/edn-name word))]
+    (filter #(and (= :fortran (:kind %)) (= w (str/lower-case (str (:name %))))) (all-defs))))
+
+(defn- defs-at
+  "The definitions under the LSP position in the document."
+  [path {:strs [line character]}]
+  (let [text (get-in @state [:docs path :text] "")
+        l (nth (lines text) line "")
+        col (utf16->col l character)]
+    (case (lang-of path)
+      :clojure (when-let [[sym] (token-at l col)] (resolve-symbol path text sym))
+      :fortran (when-let [[w] (fortran-word-at l col)] (fortran-routines w))
+      nil)))
+
+;;; ---- what a definition shows ------------------------------------------------------
+
+(def ^:private symbol-kinds
+  ;; LSP SymbolKind
+  {:ns 3 :in-ns 3 :def 13 :defn 12 :defmacro 12 :defmulti 12 :defmethod 6 :defprotocol 11 :protocol-fn 6
+   :defrecord 5 :deftype 5 :definterface 11 :declare 13 :fortran 12})
+
+(def ^:private completion-kinds
+  ;; LSP CompletionItemKind
+  {:ns 9 :in-ns 9 :def 6 :defn 3 :defmacro 3 :defmulti 3 :defmethod 2 :defprotocol 8 :protocol-fn 2
+   :defrecord 7 :deftype 7 :definterface 8 :declare 6 :fortran 3})
+
+(defn- signature [{:keys [ns name arglists kind macro]}]
+  (str (when (and ns (not= kind :ns)) (str ns "/")) name
+       (when (seq arglists) (str " " (str/join " " (map pr-str arglists))))
+       (when macro " macro")))
+
+(defn- hover-text [{:keys [doc kind file line module bound returns] :as d}]
+  (str "```clojure\n" (signature d) "\n```\n"
+       (when (= kind :fortran)
+         (str "Fortran" (when module (str ", module " module)) (when returns (str ", returns " returns))
+              (if bound "" "; not bound by clotran bind") "\n\n"))
+       (when doc (str doc "\n\n"))
+       (str/replace file #"^.*/" "") ":" line))
+
+(defn- symbol-information [{:keys [name ns kind] :as d}]
+  {:name (str name) :kind (symbol-kinds kind 13) :location (location d)
+   ;; an ns form's own entry carries the namespace BEFORE it
+   :containerName (when-not (#{:ns :in-ns} kind) (some-> ns str))})
+
+;;; ---- the top-level form around a position ------------------------------------------------
+
+(defn- offset-of
+  "The character offset of an LSP position in text."
+  [text {:strs [line character]}]
+  (let [ls (lines text)]
+    (+ (reduce + (map #(inc (count %)) (take line ls)))
+       (utf16->col (nth ls line "") character))))
+
+(defn- position-of
+  "The LSP position of a character offset in text."
+  [text off]
+  (loop [i 0 line 0 start 0]
+    (if (or (>= i off) (>= i (count text)))
+      {:line line :character (utf16-length (subs text start i))}
+      (if (= \newline (nth text i))
+        (recur (inc i) (inc line) (inc i))
+        (recur (inc i) line start)))))
+
+(defn- top-level-forms
+  "[start end) offsets of each top-level form of text, by the reader's
+  rules for what ends a string, a comment, a character and a list."
+  [text]
+  (let [n (count text)]
+    (loop [i 0 depth 0 start nil acc []]
+      (if (>= i n)
+        (if start (conj acc [start n]) acc)
+        (let [c (nth text i)]
+          (cond
+            (= c \;) (let [e (or (str/index-of text "\n" i) n)]
+                       (if (and start (zero? depth)) (recur e 0 nil (conj acc [start i])) (recur e depth start acc)))
+            (= c \") (let [e (loop [j (inc i)]
+                               (cond (>= j n) n
+                                     (= (nth text j) \\) (recur (+ j 2))
+                                     (= (nth text j) \") (inc j)
+                                     :else (recur (inc j))))]
+                       (if (zero? depth)
+                         (if start (recur e 0 start acc) (recur e 0 nil (conj acc [i e])))
+                         (recur e depth start acc)))
+            (= c \\) (let [s (or start i) e (min n (+ i 2))]
+                       (if (zero? depth) (recur e 0 s acc) (recur e depth start acc)))
+            (#{\( \[ \{} c) (recur (inc i) (inc depth) (or start i) acc)
+            (#{\) \] \}} c) (let [d (max 0 (dec depth))]
+                              (if (and (zero? d) start) (recur (inc i) 0 nil (conj acc [start (inc i)])) (recur (inc i) d start acc)))
+            (#{\space \tab \newline \return \,} c) (if (and start (zero? depth)) (recur (inc i) 0 nil (conj acc [start i])) (recur (inc i) depth start acc))
+            :else (recur (inc i) depth (or start i) acc)))))))
+
+(defn- form-at-point [path pos]
+  (let [text (get-in @state [:docs path :text] "")
+        off (offset-of text pos)
+        [s e] (or (first (filter (fn [[s e]] (and (<= s off) (<= off e))) (top-level-forms text)))
+                  (last (filter (fn [[_ e]] (<= e off)) (top-level-forms text))))]
+    (when s
+      {:text (subs text s e) :range {:start (position-of text s) :end (position-of text e)}})))
+
+;;; ---- diagnostics ----------------------------------------------------------------
+
+(defn- clojure-diagnostics [path]
+  (for [{:keys [error]} (filter #(= :error (:kind %)) (get-in @state [:by-file path]))
+        :let [[_ l c msg] (re-find #":(\d+):(\d+): (.*)$" error)
+              p (if l {:line (dec (parse-long l)) :character (dec (parse-long c))} {:line 0 :character 0})]]
+    {:range {:start p :end p} :severity 1 :source "clotran" :message (or msg error)}))
+
+(defn- fortran-diagnostics
+  "The Fortran compiler's syntax check of the file on disk: gfortran
+  says PATH:LINE:COL: then Error: or Warning: a few lines on; flang says
+  it on one line."
+  [path]
+  (when-let [fc (bind/fortran-compiler)]
+    (let [tmp (clotran-temp-dir (or (clotran.host.system/getenv "TMPDIR") (clotran.host.system/getenv "TEMP") "/tmp"))
+          log (str tmp "/check.log")]
+      (clotran-run [fc "-fsyntax-only" "-J" tmp "-I" (str/replace path #"/[^/]*$" "") path] nil log nil true)
+      (let [out (try (clotran-slurp log) (catch clotran.host.throwable _ ""))
+            same? #(= (absolute %) (absolute path))]
+        (loop [ls (str/split-lines out) at nil acc []]
+          (if-let [l (first ls)]
+            (if-let [[_ f ln col sev msg] (re-find #"^(.*?):(\d+):(\d+): (error|warning|portability): (.*)$" l)]
+              (recur (rest ls) nil (if (same? f) (conj acc [ln col sev msg]) acc))
+              (if-let [[_ f ln col] (re-find #"^(.*?):(\d+):(\d+):\s*$" l)]
+                (recur (rest ls) (when (same? f) [ln col]) acc)
+                (if-let [[_ sev msg] (re-find #"^(Error|Fatal Error|Warning): (.*)$" l)]
+                  (recur (rest ls) nil (if at (conj acc [(first at) (second at) sev msg]) acc))
+                  (recur (rest ls) at acc))))
+            (for [[ln col sev msg] acc
+                  :let [p {:line (dec (parse-long ln)) :character (dec (parse-long col))}]]
+              {:range {:start p :end p} :severity (if (re-find #"(?i)error" sev) 1 2)
+               :source (str/replace fc #"^.*/" "") :message msg})))))))
+
+(defn- publish-diagnostics! [t path & {:keys [compile?]}]
+  (let [ds (case (lang-of path)
+             :clojure (clojure-diagnostics path)
+             :fortran (when compile? (fortran-diagnostics path))
+             nil)]
+    (when (or (seq ds) (= :clojure (lang-of path)) compile?)
+      (rpc/write-message t {"jsonrpc" "2.0" "method" "textDocument/publishDiagnostics"
+                            "params" {:uri (path->uri path) :diagnostics (vec ds)}}))))
+
+;;; ---- completion -----------------------------------------------------------------
+
+(defn- completion-item [{:keys [name ns kind doc] :as d} label]
+  {:label label :kind (completion-kinds kind 1) :detail (signature d)
+   :documentation (when doc {:kind "plaintext" :value doc}) :sortText (str (when (= ns 'clojure.core) "~") label)})
+
+(defn- completions [path pos]
+  (let [text (get-in @state [:docs path :text] "")
+        l (nth (lines text) (get pos "line") "")
+        col (utf16->col l (get pos "character"))
+        [tok start] (token-at l col)
+        prefix (if tok (subs tok 0 (max 0 (min (count tok) (- col start)))) "")
+        {:keys [ns aliases refers]} (ns-info path text)
+        named (fn [d] (when (not= :ns (:kind d)) (str (:name d))))]
+    (if (str/includes? prefix "/")
+      (let [[a n] (str/split prefix #"/" 2)
+            target (or (get aliases a) (symbol a))]
+        (for [d (all-defs) :when (and (= target (:ns d)) (named d) (str/starts-with? (named d) n))]
+          (completion-item d (str a "/" (named d)))))
+      (concat
+       (for [d (all-defs)
+             :when (and (named d) (not (:private d))
+                        (or (= ns (:ns d)) (= 'clojure.core (:ns d)) (= (get refers (named d)) (:ns d)))
+                        (str/starts-with? (named d) prefix))]
+         (completion-item d (named d)))
+       (for [[a l] aliases :when (str/starts-with? a prefix)]
+         {:label (str a "/") :kind 9 :detail (str l)})))))
+
+;;; ---- documents ----------------------------------------------------------------
+
+(defn- doc-path [params] (uri->path (get-in params ["textDocument" "uri"])))
+
+(defn- open! [t params]
+  (let [path (doc-path params)
+        {:strs [text version]} (get params "textDocument")]
+    (swap! state assoc-in [:docs path] {:text text :version version})
+    (reindex! path text)
+    (publish-diagnostics! t path :compile? true)))
+
+(defn- change! [t params]
+  (let [path (doc-path params)
+        text (get (last (get params "contentChanges")) "text")]
+    (when text
+      (swap! state update-in [:docs path] merge {:text text :version (get-in params ["textDocument" "version"])})
+      (reindex! path text)
+      (publish-diagnostics! t path))))
+
+(defn- save! [t params]
+  (let [path (doc-path params)
+        text (or (get params "text") (get-in @state [:docs path :text]))]
+    (when text (reindex! path text))
+    (publish-diagnostics! t path :compile? true)))
+
+(defn- close! [_ params]
+  (let [path (doc-path params)]
+    (swap! state update :docs dissoc path)
+    (when (clotran-file-exists? path) (reindex! path nil))))
+
+;;; ---- requests ---------------------------------------------------------------------
+
+(def ^:private capabilities
+  {:positionEncoding "utf-16"
+   :textDocumentSync {:openClose true :change 1 :save {:includeText false}}
+   :definitionProvider true
+   :hoverProvider true
+   :documentSymbolProvider true
+   :workspaceSymbolProvider true
+   :completionProvider {:triggerCharacters ["/"] :resolveProvider false}})
+
+(defn- unknown [method] (throw (ex-info (str "clotran lsp: no such method " method) {:code -32601})))
+
+(defn- request
+  "A request's result."
+  [method params]
+  (case method
+    "initialize" (do (index-roots!)
+                     (when-let [root (get params "rootUri")]
+                       (when-not (some #(str/starts-with? % (uri->path root)) (:roots @state))
+                         (log "the client's root" (uri->path root) "is not under the project here; start clotran lsp in the project's directory")))
+                     {:capabilities capabilities
+                      :serverInfo {:name "clotran-ide" :version (str (clotran.host.system/getProperty "clotran.version"))}})
+    "shutdown" (do (swap! state assoc :shutdown true) nil)
+    "textDocument/definition" (let [ds (defs-at (doc-path params) (get params "position"))]
+                                (when (seq ds) (mapv location ds)))
+    "textDocument/hover" (when-let [d (first (defs-at (doc-path params) (get params "position")))]
+                           {:contents {:kind "markdown" :value (hover-text d)}})
+    "textDocument/documentSymbol" (let [path (doc-path params)]
+                                    (mapv symbol-information (remove #(= :error (:kind %)) (get-in @state [:by-file path]))))
+    "workspace/symbol" (let [q (str/lower-case (get params "query" ""))]
+                         (->> (all-defs)
+                              (remove #(= :error (:kind %)))
+                              (filter #(str/includes? (str/lower-case (str (:name %))) q))
+                              (take 200)
+                              (mapv symbol-information)))
+    "textDocument/completion" {:isIncomplete false :items (vec (take 300 (completions (doc-path params) (get params "position"))))}
+    "clotran/formAtPoint" (form-at-point (doc-path params) (get params "position"))
+    "clotran/namespace" {:ns (some-> (:ns (ns-info (doc-path params) (get-in @state [:docs (doc-path params) :text] ""))) str)}
+    (unknown method)))
+
+(defn- notification [t method params]
+  (case method
+    "initialized" nil
+    "textDocument/didOpen" (open! t params)
+    "textDocument/didChange" (change! t params)
+    "textDocument/didSave" (save! t params)
+    "textDocument/didClose" (close! t params)
+    nil))
+
+(defn handle!
+  "One message: a request answered, a notification acted on; false after
+  exit, which ends the loop."
+  [t m]
+  (let [method (get m "method") id (get m "id") params (get m "params")]
+    (log "<-" method (when id (str "#" id)))
+    (cond
+      (nil? method) true                 ; a response to us: we sent no request
+      (= method "exit") false
+      (contains? m "id")
+      (do (try (rpc/write-message t {"jsonrpc" "2.0" "id" id "result" (request method params)})
+               (catch clotran.host.throwable e
+                 (log "!!" method (ex-message e))
+                 (rpc/write-message t {"jsonrpc" "2.0" "id" id
+                                       "error" {"code" (or (:code (ex-data e)) -32603) "message" (str (ex-message e))}})))
+          true)
+      :else (do (try (notification t method params)
+                     (catch clotran.host.throwable e (log "!!" method (ex-message e))))
+                true))))
+
+(defn serve
+  "The server over a transport, until exit or the end of its input."
+  [t]
+  (rpc/serve t (partial handle! t)))
+
+(defn main
+  "`clotran lsp [--port N] [--verbose]`: over stdio, or one client on a
+  TCP port (0: a free one, named on stderr)."
+  [args]
+  (let [args (vec args)
+        port (some-> (second (drop-while #(not= % "--port") args)) parse-long)]
+    (swap! state assoc :verbose (boolean (some #{"--verbose"} args)))
+    (if port
+      (let [srv (net/listen port {:host "127.0.0.1"})]
+        (err (str "clotran lsp: listening on port " (:port srv)))
+        (let [conn (loop [] (or (net/accept srv 1000) (recur)))]
+          (serve (rpc/socket conn))
+          (net/close conn)
+          (net/close srv)))
+      (serve (rpc/stdio)))
+    nil))
