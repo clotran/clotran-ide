@@ -414,6 +414,47 @@
        (for [[a l] aliases :when (str/starts-with? a prefix)]
          {:label (str a "/") :kind 9 :detail (str l)})))))
 
+;;; ---- formatting, by cljfmt ----------------------------------------------------------
+;;
+;; cljfmt on clotran (github.com/clotran/cljfmt), when its source is on the
+;; path -- clotran's launcher puts it there -- is the formatter: the whole
+;; document, a range, or, as you type, the top-level form the cursor is in,
+;; each form reformatted on its own. The project's .cljfmt.edn (or
+;; cljfmt.edn) holds the options, as cljfmt's own command reads them.
+
+(defn- cljfmt-available? [] (boolean (clotran-resource "cljfmt/core.cljc")))
+
+(def ^:private formatter
+  (delay (try (require 'cljfmt.core)
+              (resolve 'cljfmt.core/reformat-string)
+              (catch clotran.host.throwable e (err "clotran lsp: cljfmt did not load:" (ex-message e)) nil))))
+
+(defn- format-options []
+  (let [root (clotran.host.system/getProperty "user.dir")
+        f (first (filter clotran-file-exists? [(str root "/.cljfmt.edn") (str root "/cljfmt.edn")]))]
+    (or (when f (try (read-string (clotran-slurp f))
+                     (catch clotran.host.throwable e (err "clotran lsp:" f (ex-message e)) nil)))
+        {})))
+
+(defn- format-text [text] (when-let [f @formatter] (f text (format-options))))
+
+(defn- format-document [path]
+  (let [text (get-in @state [:docs path :text] "")
+        out (format-text text)]
+    (when (and out (not= out text))
+      [{:range {:start {:line 0 :character 0} :end (position-of text (count text))} :newText out}])))
+
+(defn- format-forms-touching
+  "The top-level forms of the document that touch the offsets from..to,
+  each reformatted alone: one edit per form that changes."
+  [path from to]
+  (let [text (get-in @state [:docs path :text] "")]
+    (vec (for [[s e] (top-level-forms text)
+               :when (and (<= s to) (<= from e))
+               :let [piece (subs text s e) out (format-text piece)]
+               :when (and out (not= out piece))]
+           {:range {:start (position-of text s) :end (position-of text e)} :newText out}))))
+
 ;;; ---- documents ----------------------------------------------------------------
 
 (defn- doc-path [params] (uri->path (get-in params ["textDocument" "uri"])))
@@ -446,14 +487,18 @@
 
 ;;; ---- requests ---------------------------------------------------------------------
 
-(def ^:private capabilities
-  {:positionEncoding "utf-16"
-   :textDocumentSync {:openClose true :change 1 :save {:includeText false}}
-   :definitionProvider true
-   :hoverProvider true
-   :documentSymbolProvider true
-   :workspaceSymbolProvider true
-   :completionProvider {:triggerCharacters ["/"] :resolveProvider false}})
+(defn- capabilities []
+  (cond-> {:positionEncoding "utf-16"
+           :textDocumentSync {:openClose true :change 1 :save {:includeText false}}
+           :definitionProvider true
+           :hoverProvider true
+           :documentSymbolProvider true
+           :workspaceSymbolProvider true
+           :completionProvider {:triggerCharacters ["/"] :resolveProvider false}}
+    (cljfmt-available?) (assoc :documentFormattingProvider true
+                               :documentRangeFormattingProvider true
+                               :documentOnTypeFormattingProvider {:firstTriggerCharacter "\n"
+                                                                  :moreTriggerCharacter [")" "]" "}"]})))
 
 (defn- unknown [method] (throw (ex-info (str "clotran lsp: no such method " method) {:code -32601})))
 
@@ -465,7 +510,7 @@
                      (when-let [root (get params "rootUri")]
                        (when-not (some #(str/starts-with? % (uri->path root)) (:roots @state))
                          (log "the client's root" (uri->path root) "is not under the project here; start clotran lsp in the project's directory")))
-                     {:capabilities capabilities
+                     {:capabilities (capabilities)
                       :serverInfo {:name "clotran-ide" :version (str (clotran.host.system/getProperty "clotran.version"))}})
     "shutdown" (do (swap! state assoc :shutdown true) nil)
     "textDocument/definition" (let [ds (defs-at (doc-path params) (get params "position"))]
@@ -481,6 +526,11 @@
                               (take 200)
                               (mapv symbol-information)))
     "textDocument/completion" {:isIncomplete false :items (vec (take 300 (completions (doc-path params) (get params "position"))))}
+    "textDocument/formatting" (format-document (doc-path params))
+    "textDocument/rangeFormatting" (let [path (doc-path params) text (get-in @state [:docs path :text] "") r (get params "range")]
+                                     (format-forms-touching path (offset-of text (get r "start")) (offset-of text (get r "end"))))
+    "textDocument/onTypeFormatting" (let [path (doc-path params) off (offset-of (get-in @state [:docs path :text] "") (get params "position"))]
+                                      (format-forms-touching path off off))
     "clotran/formAtPoint" (form-at-point (doc-path params) (get params "position"))
     "clotran/namespace" {:ns (some-> (:ns (ns-info (doc-path params) (get-in @state [:docs (doc-path params) :text] ""))) str)}
     (unknown method)))

@@ -15,6 +15,7 @@ answers, over the process's standard input and output (or `--port N`):
 | `textDocument/documentSymbol`, `workspace/symbol` | a file's definitions; a search over the project's |
 | `textDocument/completion` | names in the file's namespace, what it refers, clojure.core, and `alias/` |
 | `textDocument/publishDiagnostics` | what the reader refuses, at its line and column, as you type; for a Fortran file the compiler's `-fsyntax-only` on open and save |
+| `textDocument/formatting`, `rangeFormatting`, `onTypeFormatting` | [cljfmt on clotran](https://github.com/clotran/cljfmt): the document, the forms a range touches, or the form being typed in (after a newline or a closing bracket), with the project's `.cljfmt.edn` |
 | `clotran/formAtPoint` | the top-level form around a position: `{text range}`, for evaluating at the cursor |
 | `clotran/namespace` | the file's namespace |
 

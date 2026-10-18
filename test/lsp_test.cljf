@@ -35,6 +35,10 @@
 (defn note [method params] {"jsonrpc" "2.0" "method" method "params" params})
 (def core-doc {"textDocument" {"uri" (uri "src/app/core.cljf")}})
 (def mylib-doc {"textDocument" {"uri" (uri "src/mylib/mylib.f90")}})
+;; a buffer that is not on disk, badly indented: what cljfmt makes of it
+(def fmt-doc {"textDocument" {"uri" (uri "src/app/fmt.cljf")}})
+(def messy-text "(ns app.fmt)\n\n(defn f [x]\n(+ x\n1))\n\n(def   y    2)\n")
+(def tidy-form "(defn f [x]\n  (+ x\n     1))")
 
 (def requests
   [(req 1 "initialize" {"rootUri" (lsp/path->uri proj) "capabilities" {}})
@@ -55,6 +59,11 @@
    (note "textDocument/didOpen" {"textDocument" {"uri" (uri "src/fortran/bad.f90") "languageId" "fortran" "version" 1 "text" (slurp (path "src/fortran/bad.f90"))}})
    (note "textDocument/didOpen" {"textDocument" {"uri" (uri "src/mylib/mylib.f90") "languageId" "fortran" "version" 1 "text" (slurp (path "src/mylib/mylib.f90"))}})
    (req 12 "textDocument/definition" (assoc mylib-doc "position" (pos-of (slurp (path "src/mylib/mylib.f90")) "norm2sq = sum" 2)))
+   (note "textDocument/didOpen" {"textDocument" {"uri" (uri "src/app/fmt.cljf") "languageId" "clojure" "version" 1 "text" messy-text}})
+   (req 15 "textDocument/formatting" (assoc fmt-doc "options" {"tabSize" 2 "insertSpaces" true}))
+   (req 16 "textDocument/rangeFormatting" (assoc fmt-doc "range" {"start" (pos-of messy-text "(+ x") "end" (pos-of messy-text "(+ x" 4)}
+                                                 "options" {"tabSize" 2 "insertSpaces" true}))
+   (req 17 "textDocument/onTypeFormatting" (assoc fmt-doc "position" (pos-of messy-text "1))") "ch" "\n" "options" {"tabSize" 2 "insertSpaces" true}))
    (req 13 "no/such" {})
    (req 14 "shutdown" nil)
    (note "exit" nil)])
@@ -136,6 +145,20 @@
     (check "definition from a Fortran file: the routine under the cursor"
            (-> (result 12) first (get-in ["range" "start" "line"]))
            10)
+    (if (get-in (result 1) ["capabilities" "documentFormattingProvider"])
+      (do
+        (check "formatting: the whole document as cljfmt writes it, one edit"
+               (let [[e & more] (result 15)]
+                 [(count (cons e more)) (get-in e ["range" "start"]) (get e "newText")])
+               ;; cljfmt's defaults leave the spaces inside (def   y    2)
+               [1 {"line" 0 "character" 0} (str "(ns app.fmt)\n\n" tidy-form "\n\n(def   y    2)\n")])
+        (check "rangeFormatting: only the top-level form the range touches"
+               (mapv #(vector (get-in % ["range" "start" "line"]) (get-in % ["range" "end" "line"]) (get % "newText")) (result 16))
+               [[2 4 tidy-form]])
+        (check "onTypeFormatting: the form around the position"
+               (mapv #(get % "newText") (result 17))
+               [tidy-form]))
+      (println "note: cljfmt is not on the path, formatting not checked"))
     (check "an unknown method is -32601" (get-in (by-id 13) ["error" "code"]) -32601)
     (check "shutdown answers null, and exit ends the session"
            [(contains? (by-id 14) "result") (result 14) (= 14 (get (last (filter #(contains? % "id") msgs)) "id"))]
