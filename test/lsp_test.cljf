@@ -141,7 +141,7 @@
       (check "diagnostics for Fortran: the compiler's error, at its line"
              (let [d (first (first ds))] [(get d "severity") (get-in d ["range" "start" "line"]) (string? (get d "message"))])
              [1 5 true])
-      (println "note: no Fortran compiler, its diagnostics not checked"))
+      (println "skipped: no Fortran compiler, its diagnostics not checked"))
     (check "definition from a Fortran file: the routine under the cursor"
            (-> (result 12) first (get-in ["range" "start" "line"]))
            10)
@@ -158,7 +158,7 @@
         (check "onTypeFormatting: the form around the position"
                (mapv #(get % "newText") (result 17))
                [tidy-form]))
-      (println "note: cljfmt is not on the path, formatting not checked"))
+      (println "skipped: cljfmt is not on the path, formatting not checked"))
     (check "an unknown method is -32601" (get-in (by-id 13) ["error" "code"]) -32601)
     (check "shutdown answers null, and exit ends the session"
            [(contains? (by-id 14) "result") (result 14) (= 14 (get (last (filter #(contains? % "id") msgs)) "id"))]

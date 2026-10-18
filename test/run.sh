@@ -6,7 +6,11 @@
 # CLOTRAN is the clotran checkout (default: beside this repository).
 here=$(cd "$(dirname "$0")/.." && pwd)
 CLOTRAN=${CLOTRAN:-$here/../clotran}
-proj=$here/test/fixtures/proj
+# the fixture project, copied: a checkout may be read-only (clotran's Linux gate mounts it so), and clotran writes .clotran-cache in a project
+work=$(mktemp -d) || exit 1
+trap 'rm -rf "$work"' EXIT
+cp -R "$here/test/fixtures/proj" "$work/proj" && rm -rf "$work/proj/.clotran-cache"
+proj=$work/proj
 export LSP_TEST_PROJ="$proj"
 export CLOTRAN_PATH="$here/src:$proj/src"
 # cljfmt on clotran, the formatter, when its checkout is beside (CLOTRAN_CLJFMT names another)
@@ -14,8 +18,6 @@ cljfmt=${CLOTRAN_CLJFMT:-$here/../cljfmt}
 [ -f "$cljfmt/src/cljfmt/core.cljc" ] && export CLOTRAN_PATH="$CLOTRAN_PATH:$cljfmt/src:$cljfmt/resources"
 run() { "$CLOTRAN/clotran-bin" "$CLOTRAN/src/clj/clojure/core.clj" "$@" </dev/null 2>&1 | grep -v '^note:\|^user=>'; }
 
-work=$(mktemp -d) || exit 1
-trap 'rm -rf "$work"' EXIT
 
 echo "--- in one process, over memory ---"
 LSP_TEST= run "$here/test/lsp_test.cljf" | tee "$work/1.txt"
