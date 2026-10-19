@@ -1,7 +1,7 @@
 # clotran-ide
 
 The language server for [clotran](https://github.com/clotran/clotran)
--- Clojure hosted on Fortran -- and, to come, its debug adapter. One
+-- Clojure hosted on Fortran -- and its debug adapter. One
 server, every editor's own client: Emacs's eglot, Neovim's built-in
 client, VS Code through the clotran extension.
 
@@ -29,8 +29,9 @@ line.
 ## The debug adapter, stage one
 
 `clotran dap` speaks the debug adapter protocol to the editor (stdio,
-or `--port N`) and drives **lldb-dap** underneath -- Xcode's, one on
-PATH, or `CLOTRAN_LLDB_DAP` -- started on a port of its own and ended
+or `--port N`) and drives **lldb-dap** underneath -- Xcode's on macOS,
+one on PATH (on Linux and Windows, install LLVM's lldb-dap), or
+`CLOTRAN_LLDB_DAP` -- started on a port of its own and ended
 with the session. It names the backend once (`clotran dap: using
 lldb-dap`), rewrites `launch` -- the editor names a clotran program,
 `{"program": "src/app/main.cljf", "args": [...], "cwd": "..."}`, and
@@ -63,14 +64,17 @@ started with `clotran dap` works.
 
 ## Using it
 
-clotran's launcher starts it: `clotran lsp` in a project's directory,
-the server from a checkout beside clotran, `CLOTRAN_IDE=dir`, or the
-commit clotran's `tools.edn` pins, fetched into the cache by
-clotran-deps on first use. No project's `deps.edn` names it.
+clotran's launcher starts it: `clotran lsp` (or `clotran dap`) in a
+project's directory. An installed clotran carries this server, at the
+commit its `tools.edn` pins; a checkout beside clotran, or
+`CLOTRAN_IDE=dir`, is used instead when there is one. No project's
+`deps.edn` names it.
 
-Emacs 29 (eglot is built in):
+Emacs 29 without clotran-mode, which does this itself -- eglot is built
+in, clojure-mode is `M-x package-install RET clojure-mode RET`:
 
 ```elisp
+(add-to-list 'auto-mode-alist '("\\.cljf\\'" . clojure-mode))
 (with-eval-after-load 'eglot
   (add-to-list 'eglot-server-programs '(clojure-mode . ("clotran" "lsp"))))
 ```
@@ -78,6 +82,7 @@ Emacs 29 (eglot is built in):
 Neovim:
 
 ```lua
+vim.filetype.add({extension = {cljf = "clojure"}})
 vim.api.nvim_create_autocmd("FileType", {pattern = "clojure", callback = function()
   vim.lsp.start({name = "clotran", cmd = {"clotran", "lsp"}, root_dir = vim.fs.root(0, "deps.edn")})
 end})
