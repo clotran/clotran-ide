@@ -278,10 +278,14 @@
 
 (defn- hover-text [{:keys [doc kind file line module bound returns] :as d}]
   (str "```clojure\n" (signature d) "\n```\n"
-       (when (= kind :fortran)
+       (cond
+         ;; a bound routine's doc is its Fortran signature, one argument a
+         ;; line (clotran.package/doc-of): kept as written, not reflowed
+         (and (= kind :fortran) doc) (str "```text\n" doc "\n```\n")
+         (= kind :fortran)
          (str "Fortran" (when module (str ", module " module)) (when returns (str ", returns " returns))
-              (if bound "" "; not bound by clotran bind") "\n\n"))
-       (when doc (str doc "\n\n"))
+              (if bound "" "; not bound by clotran bind") "\n\n")
+         doc (str doc "\n\n"))
        (str/replace file #"^.*/" "") ":" line))
 
 (defn- symbol-information [{:keys [name ns kind] :as d}]

@@ -49,6 +49,7 @@
    (req 4 "textDocument/definition" (assoc core-doc "position" (pos-of core-text "(map inc" 1)))
    (req 5 "textDocument/definition" (assoc core-doc "position" (pos-of core-text "mylib.raw/scale" 12)))
    (req 6 "textDocument/hover" (assoc core-doc "position" (pos-of core-text "u/shout" 2)))
+   (req 18 "textDocument/hover" (assoc core-doc "position" (pos-of core-text "mylib.raw/scale" 12)))
    (req 7 "textDocument/documentSymbol" core-doc)
    (req 8 "workspace/symbol" {"query" "shou"})
    (req 9 "clotran/formAtPoint" (assoc core-doc "position" (pos-of core-text "(u/shout")))
@@ -120,6 +121,14 @@
            (let [v (get-in (result 6) ["contents" "value"])]
              [(str/includes? v "app.util/shout [s]") (str/includes? v "Louder.")])
            [true true])
+    ;; what the doc says, not how it is fenced: the server tools.edn pins
+    ;; answers this session too (clotran's check-lsp)
+    (check "hover on mylib.raw/scale: its Fortran signature, an argument a line"
+           (let [v (get-in (result 18) ["contents" "value"])]
+             (if (and (str/includes? v "Fortran subroutine scale(n, a, x) in module mylib")
+                      (str/includes? v "\n    x  real(8), dimension(n), intent(inout) -- a double-array of length n"))
+               :said v))
+           :said)
     (check "documentSymbol: the file's definitions, with their namespace"
            (set (map #(vector (get % "name") (get % "containerName")) (result 7)))
            #{["app.core" nil] ["greet" "app.core"] ["counter" "app.core"] ["run" "app.core"]})
